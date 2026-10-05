@@ -16,6 +16,10 @@ let analyzeTimer = null, saveTimer = null;
 let panelDirty = true;
 let workspaceRev = 0;      // 当前工作区修订号（GET 响应头 / PUT 响应体维护）
 let currentRelease = null; // 当前发布（GET /api/release）
+let serverRoute = null;    // 服务端工作区已落库的航线（自动保存基线）
+let serverNfzs = [];       // 服务端工作区已落库的禁飞区（核准基线）
+let nfzDraftErr = null;    // 最近一次禁飞区核准失败响应（原因 + 明细）
+let lastDraftHtml = null;  // 草稿框渲染缓存（避免输入时无谓重建）
 
 // ----------------------------------------------------------- 工具
 const $ = (sel) => document.querySelector(sel);
@@ -28,6 +32,7 @@ const el = (tag, attrs = {}, parent) => {
   return n;
 };
 const uid = (p) => p + Math.random().toString(36).slice(2, 8);
+const clone = (o) => JSON.parse(JSON.stringify(o));
 const num = (v, d = 0) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
 const r2 = (v) => Math.round(v * 100) / 100;
 const fmtTime = (iso) => {
@@ -76,15 +81,35 @@ async function loadState() {
   state.route.unitScale ||= 100;
   state.route.corridorHalfWidth ||= 0.3;
   state.nfzs ||= [];
+  serverRoute = clone(state.route);
+  serverNfzs = clone(state.nfzs);
 }
+// 已发布航线时：禁飞区改动只留本地草稿，自动保存不得顺带落库
+const routeDirty = () => JSON.stringify(state.route) !== JSON.stringify(serverRoute);
+const nfzsDirty = () => JSON.stringify(state.nfzs) !== JSON.stringify(serverNfzs);
+const nfzDraftPending = () => !!currentRelease && nfzsDirty();
 async function saveStateNow() {
   clearTimeout(saveTimer);
-  const r = await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
-  if (r && typeof r.rev === "number") workspaceRev = r.rev;
+  if (currentRelease && !routeDirty()) { refreshNfzDraftBox(); return true; } // 仅草稿禁飞区变化：不落库
+  const payload = {
+    route: clone(state.route),
+    nfzs: currentRelease ? serverNfzs : clone(state.nfzs), // 已发布：草稿禁飞区不随航线落库
+  };
+  try {
+    const r = await api("/api/state", { method: "PUT", body: JSON.stringify(payload) });
+    if (r && typeof r.rev === "number") workspaceRev = r.rev;
+    serverRoute = payload.route; // 已落库的是提交时的快照（提交期间的后续改动仍算脏，会再触发保存）
+    if (!currentRelease) serverNfzs = payload.nfzs;
+  } catch (e) {
+    return false; // 保留脏标记，下次编辑再试
+  }
+  refreshNfzDraftBox();
+  return true;
 }
 function scheduleSave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(saveStateNow, 500);
+  refreshNfzDraftBox();
 }
 function scheduleAnalyze() {
   clearTimeout(analyzeTimer);
@@ -319,6 +344,7 @@ function renderPanel() {
   });
 
   renderDynamicPanel();
+  refreshNfzDraftBox();
 }
 
 // 仅刷新文本，不重建表单（避免输入失焦）
@@ -573,12 +599,12 @@ function renderRelease(err) {
     html += `<div class="summary">暂无发布</div>`;
   }
   box.innerHTML = html;
+  refreshNfzDraftBox();
 }
 
 async function publishVersion(v) {
-  try {
-    await saveStateNow(); // 先落库，保证发布用的是最新工作区禁飞区与修订号
-  } catch (e) {
+  const saved = await saveStateNow(); // 先落库，保证发布用的是最新工作区禁飞区与修订号
+  if (!saved) {
     toast("工作区保存失败，无法发布");
     return;
   }
@@ -614,6 +640,99 @@ async function publishVersion(v) {
     renderRelease(r);
     toast("发布失败：" + (r.error || "未知原因"));
   }
+}
+
+// ----------------------------------------------------------- 禁飞区核准
+// 已有发布记录时：禁飞区的增删/拖动/修改（含载入版本带来的变化）只留本地草稿，
+// 提交核准后才由服务端原子替换工作区禁飞区；尚未发布时仍随工作区自动保存。
+function refreshNfzDraftBox() {
+  const box = $("#nfzDraftBox");
+  if (!box) return;
+  let html = "";
+  if (currentRelease) {
+    if (nfzDraftPending()) {
+      html += `<div class="draft-box">
+        <div class="draft-warn">⚠ 禁飞区改动暂存为本地草稿，核准前不会写入工作区（航线编辑仍自动保存）</div>
+        <div class="draft-actions">
+          <button id="btnNfzApprove" class="primary-btn">✔ 提交禁飞区核准</button>
+          <button id="btnNfzDiscard" class="minor">放弃草稿</button>
+        </div>
+      </div>`;
+    } else {
+      html += `<div class="draft-note">禁飞区与工作区一致（修订 #${workspaceRev}）；后续改动将先留作草稿，核准后生效</div>`;
+    }
+  }
+  if (nfzDraftErr) {
+    html += `<div class="error-line">⚠ 核准未通过：${esc(nfzDraftErr.error || "未知原因")}（草稿未落库，可继续修改后重新提交）</div>`;
+    for (const e of nfzDraftErr.errors || []) {
+      html += `<div class="error-line">⚠ ${esc(e.message)}</div>`;
+    }
+    for (const e of nfzDraftErr.entries || []) {
+      html += `<div class="entry-line">✈ ${esc(e.nfzName)} · 航段${e.segIndex + 1} ·
+        ${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m</div>`;
+    }
+    if (nfzDraftErr.details) {
+      for (const [k, v] of Object.entries(nfzDraftErr.details)) {
+        const label = k === "workspaceRev" ? "工作区修订号" : "已发布号";
+        html += `<div class="entry-line">${label}：读取时 ${v.expected} → 当前 ${v.actual}</div>`;
+      }
+    }
+  }
+  if (html === lastDraftHtml) return;
+  lastDraftHtml = html;
+  box.innerHTML = html;
+  const approve = $("#btnNfzApprove");
+  if (approve) approve.onclick = submitNfzApproval;
+  const discard = $("#btnNfzDiscard");
+  if (discard) discard.onclick = discardNfzDraft;
+}
+
+async function submitNfzApproval() {
+  if (!currentRelease) return;
+  const submitted = clone(state.nfzs); // 提交快照：响应到达前的后续改动仍算草稿
+  let r;
+  try {
+    r = await api("/api/nfz-approval", {
+      method: "POST",
+      body: JSON.stringify({
+        nfzs: submitted,
+        workspaceRev,
+        releaseSeq: currentRelease.seq,
+      }),
+    });
+  } catch (e) {
+    toast("核准请求失败：" + e);
+    return;
+  }
+  if (r.ok) {
+    if (typeof r.rev === "number") workspaceRev = r.rev;
+    serverNfzs = submitted; // 服务端落库的正是本次提交快照
+    nfzDraftErr = null;
+    refreshNfzDraftBox();
+    toast(`禁飞区变更已核准（工作区修订 #${workspaceRev}）`);
+  } else {
+    if (r.reason === "stale") {
+      // 工作区修订号/已发布号已变化：先同步最新状态，再展示失败原因
+      try {
+        const cur = await api("/api/release");
+        if (cur && cur.ok) {
+          currentRelease = cur.release;
+          if (typeof cur.workspaceRev === "number") workspaceRev = cur.workspaceRev;
+        }
+      } catch (e) { /* 忽略 */ }
+      renderRelease();
+    }
+    nfzDraftErr = r;
+    refreshNfzDraftBox();
+    toast("核准未通过：" + (r.error || "未知原因"));
+  }
+}
+
+function discardNfzDraft() {
+  state.nfzs = clone(serverNfzs);
+  nfzDraftErr = null;
+  if (selection.type === "nfz") selection = { type: null, id: null };
+  afterStructuralChange();
 }
 
 // ----------------------------------------------------------- 版本
@@ -657,9 +776,9 @@ $("#btnSaveVer").onclick = async () => {
 (async function init() {
   setMode("select");
   await loadState();
+  await loadRelease(); // 尽早确认是否已发布，决定自动保存是否避开草稿禁飞区
   renderPanel();
   fitView();
   loadVersions();
-  loadRelease();
   runAnalyze();
 })();

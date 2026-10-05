@@ -4,6 +4,8 @@
 
 此外支持**发布航线**：从任一命名版本取**航线**，配上**当前工作区的禁飞区**重新审查；仅当版本存在、航线含非零长度航段、审查无错误无冲突、且提交时读到的工作区修订号与已发布号未变化时，才原子落库一条**递增发布号**的发布记录（来源版本 ID、组合状态、审查结果快照）。发布记录不可改写：之后编辑工作区或删除来源版本都不影响已发布内容。
 
+已有发布记录后，禁飞区变更走**核准**流程：页面对禁飞区的增删、拖动与修改（含载入版本带来的禁飞区变化）先留作**本地草稿**；航线编辑仍自动保存，但不会顺带落库草稿禁飞区。点「✔ 提交禁飞区核准」时携带所见工作区修订号与发布号，服务端把候选禁飞区与**最新发布快照中的航线**组合审查：审查报错、有冲突或任一号已变化时返回原因与冲突明细，工作区与已发布内容均不变，草稿可继续修改再提交；通过时仅原子替换工作区禁飞区并递增修订号，最新工作区航线与发布快照都保留。尚未发布时禁飞区仍随工作区自动保存，无需核准。
+
 ## 一条命令启动
 
 ```bash
@@ -63,6 +65,7 @@ python app.py          # 同样监听 http://localhost:8000
 | 重算 | 任何编辑后自动重算（约 350ms 防抖），也可点「重新审查」 |
 | 保存版本 | 顶部输入版本名（可空，自动用时间戳）→「💾 保存版本」；侧栏可载入/删除 |
 | 发布航线 | 版本列表点「发布」：取该版本航线 + 当前工作区禁飞区重新审查，通过后落库；侧栏「当前发布」查看发布号、来源版本与审查结果 |
+| 禁飞区核准 | 已有发布时：禁飞区改动先存本地草稿（不随自动保存落库），侧栏「✔ 提交禁飞区核准」与最新发布航线组合审查，通过后原子生效；「放弃草稿」可还原 |
 
 首次启动会写入一条演示数据（4 个航点、3 个禁飞区，含平面+高度+时窗命中、高度不命中、时窗不命中三种样例）。
 
@@ -78,6 +81,7 @@ python app.py          # 同样监听 http://localhost:8000
 | GET/DELETE | `/api/versions/<id>` | 取出版本快照 / 删除 |
 | GET | `/api/release` | 当前发布（发布号、来源版本、组合状态、审查结果）及当前 `workspaceRev`/`releaseSeq` |
 | POST | `/api/release` | 发布航线 `{versionId, workspaceRev, releaseSeq}`，见下文示例 |
+| POST | `/api/nfz-approval` | 已发布航线的禁飞区变更核准 `{nfzs, workspaceRev, releaseSeq}`，见下文示例 |
 
 ### 发布航线（POST /api/release）
 
@@ -124,9 +128,49 @@ curl -s http://localhost:8000/api/release
 
 > 提示：工作区再被编辑后 `workspaceRev` 会变化、每次成功发布后 `releaseSeq` 会递增；用旧值重新发布会得到 `409 {"reason":"stale","details":...}`，先 `GET /api/release` 取最新两个号再重试即可。
 
+### 禁飞区变更核准（POST /api/nfz-approval）
+
+已有发布记录时，工作区禁飞区不再随页面编辑直接落库：页面改动先存本地草稿，核准通过才生效。请求体：`nfzs`（候选禁飞区列表）、`workspaceRev`、`releaseSeq`（读取时见到的两个号）。服务器在**单个事务**内依次校验，任一不满足即整体回滚、**工作区与已发布内容不变**：
+
+| 情形 | 状态码 | 响应 `reason` | 说明 |
+|---|---|---|---|
+| 字段缺失/非整数、nfzs 非列表 | 400 | `missing_fields` | — |
+| 尚未发布 | 400 | `no_release` | 未发布时禁飞区随工作区自动保存，无需核准 |
+| 工作区或已发布号已变化 | 409 | `stale` | `details` 附 `{expected, actual}` 明细 |
+| 审查存在错误 | 400 | `analysis_errors` | `errors` 附错误列表 |
+| 审查存在冲突 | 409 | `analysis_conflicts` | `entries`/`first` 附冲突明细 |
+| 通过 | 200 | — | 原子替换工作区禁飞区、修订号 +1，返回 `{ok, rev, releaseSeq}` |
+
+审查口径：候选禁飞区 ∩ **最新发布快照中的航线**（与工作区当前航线无关）；通过后工作区航线保持原样、发布记录不被改写。页面在核准成功后更新工作区修订号与草稿状态；失败时草稿保留，可继续修改后重新提交。
+
+### 核准可执行示例（端口 8000）
+
+接上文发布示例（此时 `workspaceRev=2`、`releaseSeq=1`；以 `GET /api/release` 实际返回为准）：
+
+```bash
+# ① 取当前工作区修订号与已发布号
+curl -s http://localhost:8000/api/release
+# → {"ok":true,"workspaceRev":2,"releaseSeq":1,"release":{...}}
+
+# ② 提交候选禁飞区核准（该禁飞区与已发布航线无冲突）
+curl -s -X POST http://localhost:8000/api/nfz-approval \
+  -H 'Content-Type: application/json' \
+  -d '{"nfzs":[{"id":"n1","name":"高空限制区(500m+)","vertices":[[700,140],[830,140],[830,220],[700,220]],"minAlt":500,"maxAlt":1200,"startTime":"","endTime":"","enabled":true}],"workspaceRev":2,"releaseSeq":1}'
+# → {"ok":true,"rev":3,"releaseSeq":1}
+
+# ③ 确认工作区：禁飞区已原子替换、修订号变为 3；航线与发布快照不受影响
+curl -s http://localhost:8000/api/state
+
+# ④ 与已发布航线冲突的候选会被拒绝（409，附冲突明细），工作区保持不变，可修改后重提
+curl -s -X POST http://localhost:8000/api/nfz-approval \
+  -H 'Content-Type: application/json' \
+  -d '{"nfzs":[{"id":"n2","name":"阻断区","vertices":[[250,50],[350,50],[350,150],[250,150]],"minAlt":0,"maxAlt":400,"startTime":"2026-09-24T07:00","endTime":"2026-09-24T09:00","enabled":true}],"workspaceRev":3,"releaseSeq":1}'
+# → 409 {"ok":false,"reason":"analysis_conflicts","entries":[...],"first":{...}}
+```
+
 ## 回归测试
 
-判定口径（含凹形禁飞区空隙误报、多部件两段命中、时窗截短见证点移动、线/点/时窗端点擦碰）由 `tests/test_analyze.py` 覆盖；发布航线（组合审查、递增发布号、乐观并发、失败回滚、发布不可变）由 `tests/test_release.py` 覆盖，均仅用标准库 `unittest`：
+判定口径（含凹形禁飞区空隙误报、多部件两段命中、时窗截短见证点移动、线/点/时窗端点擦碰）由 `tests/test_analyze.py` 覆盖；发布航线（组合审查、递增发布号、乐观并发、失败回滚、发布不可变）由 `tests/test_release.py` 覆盖；禁飞区核准（发布快照航线组合审查、原子替换工作区禁飞区、并发回退、发布不可变）由 `tests/test_nfz_approval.py` 覆盖，均仅用标准库 `unittest`：
 
 ```bash
 python3 -m unittest discover -s tests        # 需已 pip install -r requirements.txt
@@ -135,11 +179,12 @@ python3 -m unittest discover -s tests        # 需已 pip install -r requirement
 ## 目录结构
 
 ```
-app.py                 # Flask 后端：SQLite、时窗/高度/平面冲突计算（Shapely）、发布航线
+app.py                 # Flask 后端：SQLite、时窗/高度/平面冲突计算（Shapely）、发布航线、禁飞区核准
 tests/test_analyze.py  # 判定口径回归（凹形空隙、两段命中、时窗截断、擦碰）
 tests/test_release.py  # 发布航线回归（组合审查、并发回退、不可变性）
+tests/test_nfz_approval.py # 禁飞区核准回归（快照航线审查、原子替换、并发回退）
 templates/index.html   # 单页布局
-static/app.js          # 原生 JS：SVG 渲染、拖动、绘制、重算、版本、发布
+static/app.js          # 原生 JS：SVG 渲染、拖动、绘制、重算、版本、发布、禁飞区草稿核准
 static/style.css       # 样式
 Dockerfile             # python:3.12-slim + gunicorn
 docker-compose.yml     # 一条命令启动，端口 8000，卷持久化

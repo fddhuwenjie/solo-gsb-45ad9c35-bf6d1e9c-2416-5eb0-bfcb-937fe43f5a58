@@ -678,6 +678,88 @@ def publish_release():
     return jsonify({"ok": True, "release": release_dict(row)})
 
 
+# ---------------------------------------------------------------- 禁飞区核准
+@app.post("/api/nfz-approval")
+def submit_nfz_approval():
+    """已发布航线的禁飞区变更核准。
+
+    提交 {nfzs, workspaceRev, releaseSeq}：候选禁飞区与最新发布快照中的
+    航线组合审查。通过则在单个 IMMEDIATE 事务内仅原子替换工作区禁飞区并
+    递增修订号（最新工作区航线与发布快照均保留）；审查报错、有冲突或
+    任一号已变化时整体回滚，工作区与已发布内容不变，草稿可继续修改。
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    nfzs = body.get("nfzs")
+    try:
+        ws_rev = int(body.get("workspaceRev"))
+        rel_seq = int(body.get("releaseSeq"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "必须提交禁飞区列表 nfzs 与整数 workspaceRev、releaseSeq"}), 400
+    if not isinstance(nfzs, list):
+        return jsonify({"ok": False, "reason": "missing_fields",
+                        "error": "必须提交禁飞区列表 nfzs 与整数 workspaceRev、releaseSeq"}), 400
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        rel_row = db.execute(
+            "SELECT * FROM releases ORDER BY id DESC LIMIT 1").fetchone()
+        if rel_row is None:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "no_release",
+                            "error": "尚未发布航线，禁飞区随工作区自动保存，无需核准"}), 400
+
+        # 乐观并发：提交时读到的工作区修订号/已发布号须与当前一致
+        details = {}
+        cur_rev = workspace_rev(db)
+        if ws_rev != cur_rev:
+            details["workspaceRev"] = {"expected": ws_rev, "actual": cur_rev}
+        cur_seq = current_release_seq(db)
+        if rel_seq != cur_seq:
+            details["releaseSeq"] = {"expected": rel_seq, "actual": cur_seq}
+        if details:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "stale",
+                            "error": "工作区或已发布号已变化，请刷新后重试",
+                            "details": details}), 409
+
+        # 候选禁飞区 ∩ 最新发布快照中的航线（与工作区当前航线无关）
+        rel_state = json.loads(rel_row["state"])
+        result = analyze({"route": rel_state.get("route") or {}, "nfzs": nfzs})
+        if result["errors"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_errors",
+                            "error": "审查存在错误，未核准",
+                            "errors": result["errors"]}), 400
+        if result["entries"]:
+            db.rollback()
+            return jsonify({"ok": False, "reason": "analysis_conflicts",
+                            "error": f"审查发现 {len(result['entries'])} 处冲突，未核准",
+                            "entries": result["entries"],
+                            "first": result["first"]}), 409
+
+        # 通过：仅原子替换工作区禁飞区（保留最新工作区航线），修订号 +1；
+        # 发布快照不做任何改动
+        ws_row = db.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+        ws_state = json.loads(ws_row["v"]) if ws_row else {}
+        ws_state["nfzs"] = nfzs
+        db.execute(
+            "INSERT INTO kv(k,v) VALUES('state',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (json.dumps(ws_state, ensure_ascii=False),),
+        )
+        db.execute(
+            "INSERT INTO kv(k,v) VALUES('state_rev','2') "
+            "ON CONFLICT(k) DO UPDATE SET v=CAST(CAST(v AS INTEGER)+1 AS TEXT)"
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return jsonify({"ok": True, "rev": workspace_rev(db),
+                    "releaseSeq": current_release_seq(db)})
+
+
 init_db()
 
 if __name__ == "__main__":
