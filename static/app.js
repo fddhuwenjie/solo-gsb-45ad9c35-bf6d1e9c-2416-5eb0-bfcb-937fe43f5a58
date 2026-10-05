@@ -16,6 +16,7 @@ let analyzeTimer = null, saveTimer = null;
 let panelDirty = true;
 let workspaceRev = 0;      // 当前工作区修订号（GET 响应头 / PUT 响应体维护）
 let currentRelease = null; // 当前发布（GET /api/release）
+let savedNfzs = [];        // 工作区已落库的禁飞区（已有发布时，页面的禁飞区编辑只存草稿）
 
 // ----------------------------------------------------------- 工具
 const $ = (sel) => document.querySelector(sel);
@@ -28,6 +29,7 @@ const el = (tag, attrs = {}, parent) => {
   return n;
 };
 const uid = (p) => p + Math.random().toString(36).slice(2, 8);
+const clone = (o) => JSON.parse(JSON.stringify(o));
 const num = (v, d = 0) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
 const r2 = (v) => Math.round(v * 100) / 100;
 const fmtTime = (iso) => {
@@ -76,11 +78,16 @@ async function loadState() {
   state.route.unitScale ||= 100;
   state.route.corridorHalfWidth ||= 0.3;
   state.nfzs ||= [];
+  savedNfzs = clone(state.nfzs);
 }
 async function saveStateNow() {
   clearTimeout(saveTimer);
-  const r = await api("/api/state", { method: "PUT", body: JSON.stringify(state) });
+  // 已有发布时：航线编辑仍自动保存，但禁飞区变更只存草稿，
+  // 落库的禁飞区必须是已核准的 savedNfzs，不得顺带写入草稿内容
+  const payload = currentRelease ? { route: state.route, nfzs: savedNfzs } : state;
+  const r = await api("/api/state", { method: "PUT", body: JSON.stringify(payload) });
   if (r && typeof r.rev === "number") workspaceRev = r.rev;
+  if (!currentRelease) savedNfzs = clone(state.nfzs); // 未发布：整体落库，镜像同步
 }
 function scheduleSave() {
   clearTimeout(saveTimer);
@@ -303,15 +310,15 @@ function renderPanel() {
       <div class="form-row"><label>生效止</label>
         <input data-f="endTime" type="datetime-local" step="60" value="${nz.endTime || ""}"></div>
       <div class="summary">${(nz.vertices || []).length} 个顶点${selection.type === "nfz" && selection.id === nz.id ? "（黄色顶点可在画布拖动）" : ""}</div>`;
-    card.querySelector(".del-btn").onclick = () => { state.nfzs.splice(i, 1); afterStructuralChange(); };
+    card.querySelector(".del-btn").onclick = () => { state.nfzs.splice(i, 1); afterNfzStructuralChange(); };
     card.querySelector('input[type="checkbox"]').onchange = (e) => {
-      nz.enabled = e.target.checked; renderBoard(); scheduleAnalyze(); scheduleSave();
+      nz.enabled = e.target.checked; renderBoard(); scheduleAnalyze(); saveOrDraftNfz();
     };
     card.querySelectorAll('input:not([type="checkbox"])').forEach((inp) => {
       inp.oninput = () => {
         const f = inp.dataset.f;
         nz[f] = f === "name" || f === "startTime" || f === "endTime" ? inp.value : num(inp.value);
-        renderBoard(); scheduleAnalyze(); scheduleSave();
+        renderBoard(); scheduleAnalyze(); saveOrDraftNfz();
       };
       inp.onfocus = () => { selection = { type: "nfz", id: nz.id }; renderBoard(); markPanelDirty(); };
     });
@@ -319,6 +326,7 @@ function renderPanel() {
   });
 
   renderDynamicPanel();
+  renderNfzDraft();
 }
 
 // 仅刷新文本，不重建表单（避免输入失焦）
@@ -367,6 +375,10 @@ function renderResults() {
 // ----------------------------------------------------------- 结构变更
 function afterStructuralChange() {
   renderBoard(); renderPanel(); scheduleAnalyze(); scheduleSave();
+}
+// 禁飞区结构变更：已有发布时只留草稿，不触发落库
+function afterNfzStructuralChange() {
+  renderBoard(); renderPanel(); scheduleAnalyze(); saveOrDraftNfz();
 }
 function deleteWaypoint(i) {
   const r = state.route;
@@ -446,8 +458,10 @@ window.addEventListener("mouseup", (e) => {
       selection = { type: null, id: null };
       markPanelDirty(); renderBoard();
     }
-  } else if (d.kind === "wp" || d.kind === "vertex") {
+  } else if (d.kind === "wp") {
     if (d.moved) { scheduleAnalyze(); scheduleSave(); }
+  } else if (d.kind === "vertex") {
+    if (d.moved) { scheduleAnalyze(); saveOrDraftNfz(); }
   }
 });
 
@@ -466,7 +480,7 @@ svg.addEventListener("dblclick", (e) => {
         minAlt: 0, maxAlt: 300, startTime: "", endTime: "", enabled: true,
       });
       drawing = [];
-      afterStructuralChange();
+      afterNfzStructuralChange();
     }
   }
 });
@@ -522,7 +536,7 @@ $("#btnAddNfz").onclick = () => {
     minAlt: 0, maxAlt: 300, startTime: "", endTime: "", enabled: true,
   });
   selection = { type: "nfz", id: state.nfzs[state.nfzs.length - 1].id };
-  afterStructuralChange();
+  afterNfzStructuralChange();
 };
 
 // ----------------------------------------------------------- 发布
@@ -538,6 +552,7 @@ async function loadRelease() {
     }
   } catch (e) { /* 保持现状 */ }
   renderRelease();
+  renderNfzDraft();
 }
 
 // err 非空时在发布卡片上方展示最近一次发布失败的原因与明细
@@ -599,6 +614,7 @@ async function publishVersion(v) {
   if (r.ok) {
     currentRelease = r.release;
     renderRelease();
+    renderNfzDraft(); // 进入“已有发布”状态：此后的禁飞区变更先存草稿
     toast(`已发布 #${r.release.seq}（来源：${r.release.sourceVersionName}）`);
   } else {
     if (r.reason === "stale") {
@@ -614,6 +630,107 @@ async function publishVersion(v) {
     renderRelease(r);
     toast("发布失败：" + (r.error || "未知原因"));
   }
+}
+
+// ----------------------------------------------------------- 禁飞区草稿核准
+// 已有发布时，禁飞区的增删/拖动/修改（含载入版本带来的变化）只存为页面草稿，
+// 提交核准通过后才替换工作区禁飞区；尚未发布时沿用原自动保存。
+function saveOrDraftNfz() {
+  if (currentRelease) renderNfzDraft(); // 留作草稿，不落库
+  else scheduleSave();
+}
+function nfzDraftDirty() {
+  return !!currentRelease && JSON.stringify(state.nfzs) !== JSON.stringify(savedNfzs);
+}
+
+// err 非空时展示最近一次核准失败的原因与明细（草稿保留，可继续修改）
+function renderNfzDraft(err) {
+  const box = $("#nfzDraftBox");
+  if (!box) return;
+  if (!currentRelease) { box.innerHTML = ""; return; }
+  let html = "";
+  if (err) {
+    html += `<div class="error-line">⚠ 核准未通过：${esc(err.error || "未知原因")}</div>`;
+    for (const e of err.errors || []) {
+      html += `<div class="error-line">⚠ ${esc(e.message)}</div>`;
+    }
+    for (const e of err.entries || []) {
+      html += `<div class="entry-line">✈ ${esc(e.nfzName)} · 航段${e.segIndex + 1} ·
+        ${fmtTime(e.enterTime)}→${fmtTime(e.exitTime)} · 高度 ${e.altLow}–${e.altHigh}m</div>`;
+    }
+    if (err.details) {
+      for (const [k, v] of Object.entries(err.details)) {
+        const label = k === "workspaceRev" ? "工作区修订号" : "已发布号";
+        html += `<div class="entry-line">${label}：读取时 ${v.expected} → 当前 ${v.actual}</div>`;
+      }
+    }
+  }
+  if (nfzDraftDirty()) {
+    html += `<div class="draft-card">
+      <div class="draft-head">● 禁飞区草稿未核准</div>
+      <div class="summary">变更仅暂存于本页，尚未落库；提交后将与发布 #${currentRelease.seq} 的航线组合审查，通过才替换工作区禁飞区。</div>
+      <div class="draft-actions">
+        <button id="btnNfzApprove">提交核准</button>
+        <button id="btnNfzDiscard" class="minor">放弃草稿</button>
+      </div>
+    </div>`;
+  } else {
+    html += `<div class="summary">已有发布 #${currentRelease.seq} ｜ 工作区修订 ${workspaceRev}：此后的禁飞区变更先存为草稿，核准后生效。</div>`;
+  }
+  box.innerHTML = html;
+  const approveBtn = $("#btnNfzApprove"), discardBtn = $("#btnNfzDiscard");
+  if (approveBtn) approveBtn.onclick = submitNfzApproval;
+  if (discardBtn) discardBtn.onclick = discardNfzDraft;
+}
+
+async function submitNfzApproval() {
+  try {
+    await saveStateNow(); // 先落库航线编辑，保证提交的是所见修订号
+  } catch (e) {
+    toast("工作区保存失败，无法提交核准");
+    return;
+  }
+  let r;
+  try {
+    r = await api("/api/nfz-approval", {
+      method: "POST",
+      body: JSON.stringify({
+        nfzs: state.nfzs,
+        workspaceRev,
+        releaseSeq: currentRelease ? currentRelease.seq : 0,
+      }),
+    });
+  } catch (e) {
+    toast("核准请求失败：" + e);
+    return;
+  }
+  if (r.ok) {
+    workspaceRev = r.rev;
+    savedNfzs = clone(state.nfzs); // 草稿已成为工作区禁飞区
+    renderNfzDraft();
+    toast(`禁飞区变更已核准（工作区修订 ${r.rev}）`);
+  } else {
+    if (r.reason === "stale") {
+      // 已发布号/工作区已变化：先同步最新状态，再展示失败原因
+      try {
+        const cur = await api("/api/release");
+        if (cur && cur.ok) {
+          currentRelease = cur.release;
+          if (typeof cur.workspaceRev === "number") workspaceRev = cur.workspaceRev;
+        }
+      } catch (e) { /* 忽略 */ }
+      renderRelease();
+    }
+    renderNfzDraft(r); // 草稿保留，可继续修改后重新提交
+    toast("核准未通过：" + (r.error || "未知原因"));
+  }
+}
+
+function discardNfzDraft() {
+  state.nfzs = clone(savedNfzs); // 还原为工作区已核准内容（无需落库，服务端本就是它）
+  if (selection.type === "nfz") selection = { type: null, id: null };
+  renderPanel(); renderBoard(); runAnalyze();
+  toast("已放弃禁飞区草稿");
 }
 
 // ----------------------------------------------------------- 版本
@@ -635,9 +752,10 @@ async function loadVersions() {
       const full = await api(`/api/versions/${v.id}`);
       Object.assign(state, full.state);
       selection = { type: null, id: null };
-      await saveStateNow();
+      await saveStateNow(); // 已有发布时仅落库航线，版本带来的禁飞区变化留作草稿
       renderPanel(); fitView(); runAnalyze();
-      toast("已载入版本 " + v.name);
+      toast(currentRelease && nfzDraftDirty()
+        ? `已载入版本 ${v.name}（禁飞区变化已存为草稿）` : "已载入版本 " + v.name);
     };
     item.querySelector('[data-act="del"]').onclick = async () => {
       if (!confirm(`删除版本「${v.name}」？`)) return;
